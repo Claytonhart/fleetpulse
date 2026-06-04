@@ -74,7 +74,7 @@ Ingest does `INSERT … ON CONFLICT (vehicle_id, ts) DO NOTHING RETURNING …`, 
 
 - [x] **Step 0** — Environment prerequisites (Docker, uv, Python 3.12, smoke tests) — `DONE` (human-owned; completed 2026-06-03. Smoke tests passed: Redis `PONG`, TimescaleDB extension `2.27.2` loaded. `websocat` skipped — optional, only for Step 10.)
 - [x] **Step 1** — Repo scaffolding, tooling, infra-only Compose — `DONE`
-- [ ] **Step 2** — Database foundation (models, Alembic, hypertable, indexes) — `TODO`
+- [x] **Step 2** — Database foundation (models, Alembic, hypertable, indexes) — `DONE`
 - [ ] **Step 3** — FastAPI app skeleton + health + DB session + `migrate`/`api` containers — `TODO`
 - [ ] **Step 4** — Ingest endpoint `POST /telemetry` (validation, idempotency, back-pressure) — `TODO`
 - [ ] **Step 5** — Fleet simulator (M2) — `TODO`
@@ -564,3 +564,86 @@ than picking just one — strictly more robust, still documented.
 once `telemetry_reading` exists. Remember the conventions: `telemetry_reading` has
 **no surrogate `id`** (composite PK `(vehicle_id, ts)`), and the hypertable/index
 DDL in Step 2 is transaction-safe (the autocommit-block requirement is Step 7 only).
+
+---
+
+### Step 2 — Database foundation (models, Alembic, hypertable, indexes) — DONE (2026-06-03)
+
+**What I built:** the async DB layer, all four v1 SQLAlchemy models, and an Alembic
+setup whose single migration creates the schema, turns `telemetry_reading` into a
+hypertable, and adds every index/constraint from SPEC §5. Wired the test harness to
+apply migrations. No app/API code (correct for Step 2).
+
+**DB layer (`backend/app/`):**
+- `config.py` — `pydantic-settings` `Settings` (database_url + pool knobs). **Key
+  decision: it does NOT load `.env`.** It reads OS env vars only, with a *localhost*
+  default for `database_url`. Compose injects `DATABASE_URL=...@timescaledb...` into
+  containers; host runs (alembic, pytest, local uvicorn) fall through to the
+  localhost default. This sidesteps the Compose-hostname-vs-localhost split cleanly
+  (the issue I flagged at end of Step 1). `.env` is for Compose to source, not the app.
+- `db/base.py` (`Base`), `db/session.py` (async `engine` + `async_session_maker`;
+  `pool_timeout` = the acquire bound Step 4 turns into a 503), `db/__init__.py` re-exports.
+
+**Models (`backend/app/models/`)** — exactly per SPEC §5:
+- `enums.py` — Python enums (`VehicleStatus`, `RuleOperator`, `Severity`,
+  `IncidentStatus`) + their native-PG-enum column types. **Decision: native Postgres
+  enum types** (not VARCHAR+CHECK). They use `create_type=False` + `values_callable`
+  so (a) the migration owns `CREATE TYPE` (avoids SQLAlchemy double-creating the
+  shared `severity` type used by both `alert_rule` and `incident`), and (b) the DB
+  stores each member's **value** — important for `RuleOperator` where value `>` ≠ name `gt`.
+- `vehicle.py`, `telemetry.py` (**no surrogate id**; composite PK `(vehicle_id, ts)`;
+  metrics nullable — real telemetry has gaps; `error_codes` JSONB default `'[]'`),
+  `alert_rule.py`, `incident.py`. SQLAlchemy 2.0 `Mapped[...]`/`mapped_column` typing
+  throughout (passes strict mypy).
+
+**Alembic (`backend/alembic*`):**
+- `alembic.ini` uses `%(here)s` so `alembic -c backend/alembic.ini …` works from any
+  CWD. `env.py` is **async** (asyncpg via `connection.run_sync`) and resolves the DB
+  URL by precedence: **`-x db_url=` > `ALEMBIC_DB_URL` env > `settings.database_url`**.
+- `versions/0001_initial_schema.py` (revision `0001`, down_revision `None`): in order —
+  `CREATE EXTENSION timescaledb` → `CREATE TYPE` ×4 → `create_table` ×4 (composite PK on
+  telemetry_reading) → `create_hypertable('telemetry_reading','ts', if_not_exists)` →
+  indexes: `telemetry_reading (vehicle_id, ts DESC)`, partial `alert_rule WHERE enabled`,
+  `incident (status, severity, vehicle_id)`, and partial-unique
+  `uq_incident_active (vehicle_id, rule_id) WHERE status != 'resolved'`. `downgrade()`
+  drops tables (FK-reverse order) then the enum types — clean round-trip. All DDL is
+  transaction-safe (no autocommit-block needed; that's Step 7).
+
+**Test harness wiring:**
+- `conftest.py::db_settings` now runs `alembic upgrade head` against the testcontainers
+  DB (via `ALEMBIC_DB_URL`) — the seam Step 1 left. **`seed_readings` is now
+  implemented** (upserts a vehicle by external_id, inserts N readings; returns internal
+  `vehicle.id`) — Steps 6/7 reuse it; tests self-seed, never via the simulator.
+- `test_schema.py` (5 tests): hypertable registered, composite PK is exactly
+  `(vehicle_id, ts)`, `uq_incident_active` is UNIQUE + PARTIAL, all 4 enum types exist,
+  and a vehicle+reading insert + the seed helper both work.
+
+**Tooling change:** excluded `backend/alembic/` from ruff + mypy (migration/env
+boilerplate — generated shape, late imports), and added `known-third-party=["alembic"]`
+to ruff isort (the local `backend/alembic/` dir made isort misclassify the `alembic`
+*package* as first-party). Noted in `pyproject.toml`.
+
+**Deviations from the plan:** none on the schema itself. One judgment call to flag:
+**I implemented `seed_readings` now** (Step 1 had left it a stub) since the table
+exists and it's part of the harness contract — it's generic (constant metric values),
+so if a later step needs richer sequences it can extend, not rewrite.
+
+**Verify — all passed:**
+- `alembic upgrade head` against the **Compose DB** (localhost:5432) → applied, `current` = `0001 (head)`.
+- psql: `telemetry_reading` in `timescaledb_information.hypertables` ✓; PK cols = `{vehicle_id, ts}` ✓; `uq_incident_active` is `UNIQUE … WHERE status <> 'resolved'` ✓; all 5 tables present.
+- `alembic downgrade base` → only `alembic_version` left, **zero** leaked enum types; `upgrade head` → hypertable back. Clean round-trip.
+- `uv run pytest` → **9/9 green** (3 harness + 5 schema + 1 seed) via testcontainers.
+- `make lint` (ruff + mypy strict) → clean.
+
+**Seams / facts the next agent (Step 3) needs:**
+- **Migration ownership:** Step 3 adds the one-shot `migrate` Compose service that runs
+  `alembic upgrade head`; in-container it should run `alembic -c <path>/alembic.ini upgrade head`
+  with `DATABASE_URL` pointing at the `timescaledb` service (env.py picks it up via
+  `settings.database_url`, since no `-x`/`ALEMBIC_DB_URL` is set in-container). No app
+  service runs migrations itself.
+- `app/config.py::settings` and `app/db/session.py` (`engine`, `async_session_maker`)
+  are ready for Step 3's request-scoped session dependency + `/health` `SELECT 1`.
+- Enum **values** stored in DB are the symbols/words (`>`, `active`, …), not enum names —
+  matters when Step 8 seeds `alert_rule` rows and Step 9 reads them back.
+- To run alembic from the **host** (tests already do this automatically), pass
+  `-x db_url=postgresql+asyncpg://fleetpulse:fleetpulse@localhost:5432/fleetpulse`.

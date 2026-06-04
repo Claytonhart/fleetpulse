@@ -43,22 +43,32 @@ bypass-selection = true
 
 [tool.ruff]
 # Lint scope: backend/ and simulator/ only — NOT frontend/ (TS, own toolchain).
+# Alembic migrations + env.py are framework boilerplate (generated shape, late
+# imports after sys.path setup) — excluded from strict lint/type-check by design.
 target-version = "py312"
 line-length = 100
 src = ["backend", "simulator"]
 include = ["backend/**/*.py", "simulator/**/*.py"]
+extend-exclude = ["backend/alembic"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.ruff.lint.isort]
+# `backend/alembic/` is a local dir, so isort misclassifies the third-party
+# `alembic` package as first-party — correct it.
+known-third-party = ["alembic"]
 
 [tool.mypy]
 python_version = "3.12"
 files = ["backend", "simulator"]
 strict = true
 plugins = ["pydantic.mypy"]
+# Alembic migrations + env.py are boilerplate; not worth strict typing.
+exclude = ['^backend/alembic/']
 # Third-party libs without bundled type stubs — don't fail the type check on them.
 [[tool.mypy.overrides]]
-module = ["testcontainers.*", "celery.*"]
+module = ["testcontainers.*", "celery.*", "alembic.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -6,10 +6,9 @@ What it does:
   * `db_container` / `redis_container` (session-scoped): start ephemeral
     TimescaleDB + Redis via `testcontainers`, using the SAME pinned images as
     Compose, so tests run identically locally and in CI (both only need Docker).
-  * `db_settings` (session-scoped): once migrations exist (Step 2), this fixture
-    runs `alembic upgrade head` against the throwaway DB before yielding. Until
-    then it yields the raw connection settings so the Step 1 harness smoke test
-    (`SELECT 1`) can prove the plumbing works before any real schema exists.
+  * `db_settings` (session-scoped): runs `alembic upgrade head` against the
+    throwaway DB once per session before yielding connection settings, so every
+    integration test that depends on it sees the full schema.
   * `db_engine` / `db_conn` (function-scoped): per-test async engine + connection
     with rollback isolation, so tests don't leak state into each other.
   * `seed_readings`: a tiny data-seeding helper later integration tests reuse to
@@ -21,10 +20,16 @@ Image tags are kept in sync with docker-compose.yml on purpose.
 
 from __future__ import annotations
 
+import os
+import pathlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 from testcontainers.postgres import PostgresContainer
 from testcontainers.redis import RedisContainer
@@ -32,6 +37,9 @@ from testcontainers.redis import RedisContainer
 # Keep these in lockstep with docker-compose.yml.
 TIMESCALE_IMAGE = "timescale/timescaledb:2.27.2-pg16"
 REDIS_IMAGE = "redis:7.4"
+
+# backend/ — where alembic.ini lives (script_location uses %(here)s under it).
+BACKEND_DIR = pathlib.Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture(scope="session")
@@ -70,15 +78,15 @@ def redis_url(redis_container: RedisContainer) -> str:
 
 @pytest.fixture(scope="session")
 def db_settings(database_url: str) -> dict[str, str]:
-    """Connection settings, with the schema applied.
+    """Connection settings, with the full schema applied via `alembic upgrade head`.
 
-    Step 2 adds Alembic migrations; at that point this fixture should run
-    `alembic upgrade head` against `database_url` here (once, session-scoped)
-    before yielding, so every integration test sees the full schema. The hook is
-    intentionally left as a single obvious place to add that call.
+    Runs once per session against the throwaway DB. env.py reads the URL from the
+    `ALEMBIC_DB_URL` env var (precedence: -x db_url > ALEMBIC_DB_URL > settings).
+    Integration tests depend on this fixture to guarantee the schema exists.
     """
-    # TODO(Step 2): apply migrations here —
-    #   alembic.config.main(["-x", f"db_url={database_url}", "upgrade", "head"])
+    os.environ["ALEMBIC_DB_URL"] = database_url
+    cfg = Config(str(BACKEND_DIR / "alembic.ini"))
+    command.upgrade(cfg, "head")
     return {"database_url": database_url}
 
 
@@ -93,8 +101,15 @@ async def db_engine(database_url: str) -> AsyncIterator[AsyncEngine]:
 
 
 @pytest_asyncio.fixture
-async def db_conn(db_engine: AsyncEngine) -> AsyncIterator[AsyncConnection]:
-    """Per-test connection in a transaction that always rolls back (isolation)."""
+async def db_conn(
+    db_settings: dict[str, str], db_engine: AsyncEngine
+) -> AsyncIterator[AsyncConnection]:
+    """Per-test connection in a transaction that always rolls back (isolation).
+
+    Depends on `db_settings` so the schema migration is guaranteed to have run
+    before any test writes — every DB-touching fixture (incl. `seed_readings`)
+    funnels through here, so tests never need to remember to request `db_settings`.
+    """
     async with db_engine.connect() as conn:
         trans = await conn.begin()
         try:
@@ -106,17 +121,56 @@ async def db_conn(db_engine: AsyncEngine) -> AsyncIterator[AsyncConnection]:
 @pytest_asyncio.fixture
 async def seed_readings(
     db_conn: AsyncConnection,
-) -> Callable[..., Awaitable[None]]:
+) -> Callable[..., Awaitable[int]]:
     """Insert N telemetry readings for a vehicle directly (no simulator).
 
-    Returns an async callable integration tests reuse. The schema does not exist
-    until Step 2; this is the reusable entry point those tests will call.
+    Upserts the vehicle by `external_id`, then writes `count` readings spaced
+    `interval_seconds` apart starting at `start_ts`. Per-row metric values come
+    from `**metrics` (constant across rows; default None). Returns the internal
+    `vehicle.id`. Writes go through the test's rollback-isolated `db_conn`.
+
+    Tests self-seed via this — never via the simulator (Step 5 is demos/load only).
     """
 
-    async def _seed(*_args: object, **_kwargs: object) -> None:  # pragma: no cover
-        raise NotImplementedError(
-            "seed_readings is wired in Step 2+ once telemetry_reading exists; "
-            "implement the INSERT against db_conn here."
-        )
+    async def _seed(
+        vehicle_external_id: str,
+        count: int = 1,
+        *,
+        start_ts: datetime | None = None,
+        interval_seconds: float = 1.0,
+        **metrics: float | None,
+    ) -> int:
+        vehicle_id: int = (
+            await db_conn.execute(
+                text(
+                    "INSERT INTO vehicle (external_id, name) VALUES (:eid, :name) "
+                    "ON CONFLICT (external_id) DO UPDATE SET name = EXCLUDED.name "
+                    "RETURNING id"
+                ),
+                {"eid": vehicle_external_id, "name": vehicle_external_id},
+            )
+        ).scalar_one()
+
+        base = start_ts or datetime(2026, 1, 1, tzinfo=UTC)
+        cols = ("lat", "lon", "speed_kph", "soc_pct", "motor_temp_c", "odometer_km")
+        rows = [
+            {
+                "vid": vehicle_id,
+                "ts": base + timedelta(seconds=i * interval_seconds),
+                **{c: metrics.get(c) for c in cols},
+            }
+            for i in range(count)
+        ]
+        if rows:
+            await db_conn.execute(
+                text(
+                    "INSERT INTO telemetry_reading (vehicle_id, ts, lat, lon, "
+                    "speed_kph, soc_pct, motor_temp_c, odometer_km) "
+                    "VALUES (:vid, :ts, :lat, :lon, :speed_kph, :soc_pct, "
+                    ":motor_temp_c, :odometer_km)"
+                ),
+                rows,
+            )
+        return vehicle_id
 
     return _seed
