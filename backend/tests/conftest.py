@@ -152,6 +152,43 @@ async def client(
 
 
 @pytest_asyncio.fixture
+async def clean_db(db_settings: dict[str, str], db_engine: AsyncEngine) -> None:
+    """Truncate data tables before a test (committed) — isolation for commit-path
+    (API/`client`) tests, which can't use `db_conn`'s rollback. alert_rule is kept."""
+    async with db_engine.begin() as conn:
+        await conn.execute(
+            text("TRUNCATE telemetry_reading, incident, vehicle RESTART IDENTITY CASCADE")
+        )
+
+
+@pytest_asyncio.fixture
+async def create_vehicle(db_engine: AsyncEngine) -> Callable[..., Awaitable[int]]:
+    """Insert a vehicle and COMMIT it (so the `client`'s separate session sees it).
+    Returns the internal `vehicle.id`."""
+
+    async def _create(
+        external_id: str,
+        *,
+        name: str | None = None,
+        model: str | None = None,
+        status: str = "active",
+    ) -> int:
+        async with db_engine.begin() as conn:
+            vehicle_id: int = (
+                await conn.execute(
+                    text(
+                        "INSERT INTO vehicle (external_id, name, model, status) "
+                        "VALUES (:e, :n, :m, CAST(:s AS vehicle_status)) RETURNING id"
+                    ),
+                    {"e": external_id, "n": name or external_id, "m": model, "s": status},
+                )
+            ).scalar_one()
+        return vehicle_id
+
+    return _create
+
+
+@pytest_asyncio.fixture
 async def seed_readings(
     db_conn: AsyncConnection,
 ) -> Callable[..., Awaitable[int]]:

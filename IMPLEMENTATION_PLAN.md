@@ -76,7 +76,7 @@ Ingest does `INSERT … ON CONFLICT (vehicle_id, ts) DO NOTHING RETURNING …`, 
 - [x] **Step 1** — Repo scaffolding, tooling, infra-only Compose — `DONE`
 - [x] **Step 2** — Database foundation (models, Alembic, hypertable, indexes) — `DONE`
 - [x] **Step 3** — FastAPI app skeleton + health + DB session + `migrate`/`api` containers — `DONE`
-- [ ] **Step 4** — Ingest endpoint `POST /telemetry` (validation, idempotency, back-pressure) — `TODO`
+- [x] **Step 4** — Ingest endpoint `POST /telemetry` (validation, idempotency, back-pressure) — `DONE`
 - [ ] **Step 5** — Fleet simulator (M2) — `TODO`
 - [ ] **Step 6** — Redis hot-state cache + read APIs (`/vehicles`) — `TODO`
 - [ ] **Step 7** — Continuous aggregates + retention/compression + telemetry read endpoint — `TODO`
@@ -724,3 +724,68 @@ need it — consistent with the "establish the harness once" convention.
   (`MAX_BATCH_READINGS`, `MAX_BODY_BYTES`) — add the matching fields to `Settings` in Step 4.
 - Body-size cap needs **ASGI middleware** (Starlette has no built-in max-body); the
   app factory in `main.py` is where to add it.
+
+---
+
+### Step 4 — Ingest endpoint POST /telemetry — DONE (2026-06-03)
+
+**What I built:** the core write path — whole-batch-validated, idempotent,
+back-pressured batch ingest — with the cache/publish/enqueue work left as a clearly
+marked seam for Steps 6 & 9.
+
+**Files added/changed:**
+- `app/schemas/telemetry.py` — `TelemetryReadingIn` (ts normalized to UTC if naive),
+  `TelemetryBatchIn`, `TelemetryIngestResponse`. Whole-batch Pydantic validation (§10.8).
+- `app/services/ingest.py` — `ingest_batch()`: (1) **one bulk query** resolves all
+  `external_id`s → ids; (2) any unknown → `UnknownVehicleError` (→422), nothing written;
+  (3) build rows, de-dupe `(vehicle_id, ts)` within the batch, track per-vehicle max ts;
+  (4) `pg_insert(...).on_conflict_do_nothing(index_elements=["vehicle_id","ts"]).returning(*cols)`
+  — RETURNING = actually-inserted rows; (5) durable status (§10.13): `last_seen_at =
+  GREATEST(last_seen_at, max_ts)` + `offline → active` per vehicle; commit; enrich
+  inserted rows with `vehicle_external_id`.
+- `app/api/telemetry.py` — `POST /telemetry` → **202** `{inserted_count, duplicate_count}`;
+  batch-size cap → 422; `UnknownVehicleError` → 422. Registered in `app/api/__init__.py`.
+- `app/middleware.py` — `BodySizeLimitMiddleware` (Content-Length fast path + chunked
+  buffering) → **413**. Wired in `main.py`, plus a global **503 + Retry-After** handler
+  for `sqlalchemy.exc.TimeoutError` (pool-acquire exhaustion). `config.py` gained
+  `max_batch_readings` / `max_body_bytes`.
+- Tests: `test_ingest.py` (happy, idempotent-duplicate, unknown→422, malformed→422,
+  oversized-batch→422, offline→active+last_seen) and `test_middleware.py` (413 under/over
+  cap, both Content-Length and chunked). New reusable fixtures in `conftest.py`:
+  **`clean_db`** (truncate for commit-path tests) and **`create_vehicle`** (committed seed,
+  so the `client`'s separate session sees it).
+
+>>> **SEAM for Steps 6 & 9 — `app/services/ingest.py::_post_insert_side_effects(readings)`** <<<
+It receives the list of **enriched** inserted readings (`EnrichedReading` = all DB fields
++ `vehicle_external_id`) and is currently a documented no-op. **Step 6** adds the Redis
+cache write + `telemetry_delta` publish here; **Step 9a** adds the per-vehicle Celery
+enqueue here. It runs **after commit** on actually-inserted rows only (so retries don't
+double-fire). The at-least-once / outbox tradeoff is now also documented in `README.md`.
+
+**Deviations from the plan:** none. Judgment calls: (1) **pre-dedupe `(vehicle_id, ts)`
+within a batch** in Python (don't rely on ON CONFLICT to swallow intra-batch dupes) so
+`duplicate_count = submitted − inserted` is unambiguous; (2) durable-status UPDATE is a
+**loop over distinct vehicles** (a batch carries only a handful) — noted it can become a
+single VALUES-join UPDATE at scale; (3) implemented the **503 pool-timeout handler** even
+though no test exercises it (hard to force pool exhaustion deterministically) — it's
+required by the task list, so it's wired globally.
+
+**Verify — all passed:**
+- Rebuilt the `api` image; seeded `VH-0007` (status `offline`) via psql (no register
+  endpoint until Step 5). `POST` batch of 2 → `202 {inserted:2, duplicate:0}`; **re-POST
+  same batch → `202 {inserted:0, duplicate:2}`, row count unchanged (2)** — idempotency holds.
+- Vehicle flipped **offline → active**, `last_seen_at` = max submitted ts (`12:00:02`).
+- Unknown vehicle → `422` (`{"detail":"unknown vehicle_external_id(s): ['VH-NOPE']"}`).
+- `uv run pytest` → **19/19 green** (+6 ingest, +3 middleware). `make lint` (ruff + mypy strict) clean.
+
+**Seams / facts the next agent (Step 5 — simulator) needs:**
+- Step 5 must **add `POST /api/v1/vehicles/register`** (idempotent upsert on `external_id`)
+  and **append it to SPEC §6** — vehicles are pre-registered; ingest 422s on unknown ids,
+  so the simulator must register its fleet on boot before streaming.
+- The ingest contract the simulator targets: body `{readings:[{vehicle_external_id, ts,
+  lat, lon, speed_kph, soc_pct, motor_temp_c, odometer_km, error_codes[]}]}` → `202
+  {inserted_count, duplicate_count}`. Batch ≤ `MAX_BATCH_READINGS` (500), body ≤ ~1 MB.
+  `ts` may be naive (treated as UTC) but sending ISO-8601 with `Z` is cleanest.
+- `SIM_*` knobs are already in `.env.example`; `SIM_API_BASE_URL` defaults to
+  `http://api:8000/api/v1` (in-Compose). The simulator is **demos/load only — never a
+  test data source** (tests self-seed via `seed_readings`/`create_vehicle`).

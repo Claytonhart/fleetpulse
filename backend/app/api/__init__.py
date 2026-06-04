@@ -7,9 +7,10 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.api import health
+from app.api import health, telemetry
 
 api_router = APIRouter()
 api_router.include_router(health.router)
+api_router.include_router(telemetry.router)
 
 __all__ = ["api_router"]

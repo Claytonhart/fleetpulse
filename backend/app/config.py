@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     # `api` container env has it and Settings doesn't reject the injected var.
     redis_url: str = "redis://localhost:6379/0"
 
+    # Ingest back-pressure caps (§10.9). Batch over cap → 422; body over cap → 413.
+    # (Broker queue-depth back-pressure is added in Step 9a, once the queue exists.)
+    max_batch_readings: int = 500
+    max_body_bytes: int = 1_048_576  # ~1 MB
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
