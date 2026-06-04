@@ -8,6 +8,8 @@ sessionmaker.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -30,3 +32,12 @@ async_session_maker: async_sessionmaker[AsyncSession] = async_sessionmaker(
     class_=AsyncSession,
     expire_on_commit=False,
 )
+
+
+async def get_session() -> AsyncIterator[AsyncSession]:
+    """Per-request async session (FastAPI dependency).
+
+    Tests override this (see `conftest.client`) to bind to the testcontainers DB.
+    """
+    async with async_session_maker() as session:
+        yield session

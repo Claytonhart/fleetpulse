@@ -1,0 +1,24 @@
+# Keep the build context lean (and the runtime image clean).
+.git
+.venv
+**/__pycache__
+*.py[cod]
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.coverage
+htmlcov
+
+# Tests aren't needed at runtime (testcontainers is a dev-only dep).
+backend/tests
+
+# Frontend has its own image (Step 11).
+frontend/node_modules
+frontend/dist
+
+# Local env + editor cruft.
+.env
+.env.*
+.DS_Store
+.idea
+.vscode

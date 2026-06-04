@@ -59,6 +59,16 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 # `alembic` package as first-party — correct it.
 known-third-party = ["alembic"]
 
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's DI markers are designed to be called in argument defaults — not bugs.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.Path",
+    "fastapi.Header",
+    "fastapi.Body",
+]
+
 [tool.mypy]
 python_version = "3.12"
 files = ["backend", "simulator"]

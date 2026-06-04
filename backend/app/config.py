@@ -33,5 +33,17 @@ class Settings(BaseSettings):
     db_max_overflow: int = 10
     db_pool_acquire_timeout_seconds: int = 5
 
+    # CORS — comma-separated origins. The separate-origin Step 11 web app + the WS
+    # connection must be allowed here; defaults to the Compose web origin.
+    cors_origins: str = "http://localhost:5173"
+
+    # Redis (broker / cache / pub-sub) — used from Step 6 on; surfaced now so the
+    # `api` container env has it and Settings doesn't reject the injected var.
+    redis_url: str = "redis://localhost:6379/0"
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
 
 settings = Settings()

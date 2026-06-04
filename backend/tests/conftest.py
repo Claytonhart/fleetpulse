@@ -29,8 +29,15 @@ import pytest
 import pytest_asyncio
 from alembic import command
 from alembic.config import Config
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from testcontainers.postgres import PostgresContainer
 from testcontainers.redis import RedisContainer
 
@@ -116,6 +123,32 @@ async def db_conn(
             yield conn
         finally:
             await trans.rollback()
+
+
+@pytest_asyncio.fixture
+async def client(
+    db_settings: dict[str, str], db_engine: AsyncEngine
+) -> AsyncIterator[AsyncClient]:
+    """An httpx client wired to the FastAPI app, with `get_session` overridden to
+    use the testcontainers DB. The canonical API-test entry point for later steps.
+
+    NOTE: requests commit through real sessions (no rollback isolation like
+    `db_conn`). Tests that write should use distinct ids or truncate between runs.
+    """
+    from app.db.session import get_session
+    from app.main import create_app
+
+    maker = async_sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def _override_get_session() -> AsyncIterator[AsyncSession]:
+        async with maker() as session:
+            yield session
+
+    app = create_app()
+    app.dependency_overrides[get_session] = _override_get_session
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as http_client:
+        yield http_client
 
 
 @pytest_asyncio.fixture

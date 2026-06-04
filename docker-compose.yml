@@ -1,9 +1,25 @@
 # FleetPulse — Docker Compose.
-# Step 1: INFRA ONLY (timescaledb + redis). App services (migrate, api, worker,
-# beat, simulator, web) are added in their own later steps.
+# Step 1: infra (timescaledb + redis). Step 3: migrate + api. Remaining app
+# services (worker, beat, simulator, web) are added in their own later steps.
 #
-# Config comes from .env (bootstrapped by `make up`). Every var also has a safe
-# ${VAR:-default} fallback so a raw `docker compose up` works without a .env too.
+# Config: every var has a safe ${VAR:-default} fallback (in-container hostnames
+# like `timescaledb`/`redis` are the defaults), so a raw `docker compose up` works
+# without a .env; `make up` bootstraps .env, which then overrides via interpolation.
+
+# Shared definition for the backend-image services (migrate + api). They run the
+# SAME image; only command/deps/ports differ.
+x-backend: &backend
+  build:
+    context: .
+    dockerfile: backend/Dockerfile
+  image: fleetpulse-backend:local
+  environment:
+    DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://fleetpulse:fleetpulse@timescaledb:5432/fleetpulse}
+    REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+    CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+    DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
+    DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+    DB_POOL_ACQUIRE_TIMEOUT_SECONDS: ${DB_POOL_ACQUIRE_TIMEOUT_SECONDS:-5}
 
 services:
   timescaledb:
@@ -36,6 +52,33 @@ services:
       timeout: 3s
       retries: 10
       start_period: 5s
+
+  # One-shot migration runner — the ONLY service that runs migrations. All app
+  # services depend on it completing (migration ownership; avoids races).
+  migrate:
+    <<: *backend
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *backend
+    command: ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
 volumes:
   timescale_data:

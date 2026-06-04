@@ -75,7 +75,7 @@ Ingest does `INSERT … ON CONFLICT (vehicle_id, ts) DO NOTHING RETURNING …`, 
 - [x] **Step 0** — Environment prerequisites (Docker, uv, Python 3.12, smoke tests) — `DONE` (human-owned; completed 2026-06-03. Smoke tests passed: Redis `PONG`, TimescaleDB extension `2.27.2` loaded. `websocat` skipped — optional, only for Step 10.)
 - [x] **Step 1** — Repo scaffolding, tooling, infra-only Compose — `DONE`
 - [x] **Step 2** — Database foundation (models, Alembic, hypertable, indexes) — `DONE`
-- [ ] **Step 3** — FastAPI app skeleton + health + DB session + `migrate`/`api` containers — `TODO`
+- [x] **Step 3** — FastAPI app skeleton + health + DB session + `migrate`/`api` containers — `DONE`
 - [ ] **Step 4** — Ingest endpoint `POST /telemetry` (validation, idempotency, back-pressure) — `TODO`
 - [ ] **Step 5** — Fleet simulator (M2) — `TODO`
 - [ ] **Step 6** — Redis hot-state cache + read APIs (`/vehicles`) — `TODO`
@@ -647,3 +647,80 @@ so if a later step needs richer sequences it can extend, not rewrite.
   matters when Step 8 seeds `alert_rule` rows and Step 9 reads them back.
 - To run alembic from the **host** (tests already do this automatically), pass
   `-x db_url=postgresql+asyncpg://fleetpulse:fleetpulse@localhost:5432/fleetpulse`.
+
+---
+
+### Step 3 — FastAPI skeleton + health + DB session + migrate/api containers — DONE (2026-06-03)
+
+**What I built:** a running FastAPI service in Compose with a DB-backed health check,
+a request-scoped async session dependency, CORS, structured logging, the backend
+Docker image, and the one-shot `migrate` service that owns migrations + the `api`
+service that depends on it. No business endpoints yet (correct for Step 3).
+
+**App (`backend/app/`):**
+- `main.py` — `create_app()` factory (uvicorn runs it with `--factory`). Adds CORS
+  middleware (origins from `settings.cors_origins_list`), mounts `api_router` at
+  `/api/v1`, calls `configure_logging()`. **It does NOT run migrations.**
+- `api/__init__.py` — `api_router` aggregator (later steps add their routers here).
+  `api/health.py` — `GET /api/v1/health` → `{status, db}`, does `SELECT 1` via the
+  session dep. `api/deps.py` — `SessionDep = Annotated[AsyncSession, Depends(get_session)]`
+  (Annotated form, so ruff B008 never fires).
+- `db/session.py` — added `get_session()` per-request async dependency.
+- `schemas/health.py` — `HealthResponse`. `log_config.py` — `configure_logging()`
+  (dependency-free key=value format; Step 13 can swap to JSON).
+- `config.py` — added `cors_origins` (+ `cors_origins_list` property) and `redis_url`.
+
+**Docker (`backend/Dockerfile`, `.dockerignore`):**
+- `python:3.12-slim`; uv (pinned `ghcr.io/astral-sh/uv:0.11.18`) installs deps from
+  the lockfile (`uv sync --frozen --no-dev --no-install-project`). **Build context is
+  the repo root** (pyproject/uv.lock/README live there); `dockerfile: backend/Dockerfile`.
+  `backend/` is copied to `/app` and run from source via **`PYTHONPATH=/app`** (the
+  `app` package isn't pip-installed — needed because uvicorn/alembic console scripts
+  don't auto-add CWD to sys.path). `.dockerignore` keeps tests/.venv/caches out of the image.
+
+**Compose (`docker-compose.yml`):**
+- A YAML anchor `x-backend` shares build/image/env across the two backend services
+  (same `fleetpulse-backend:local` image). **`environment:` uses `${VAR:-default}`
+  with in-container hostnames** (`@timescaledb`, `@redis`) as defaults — so the stack
+  works with or without `.env` (matches Step 1's infra pattern; no `env_file` needed).
+- **`migrate`**: `command: alembic upgrade head`, `depends_on` timescaledb healthy,
+  `restart: "no"` (one-shot). The ONLY migration runner. In-container, env.py resolves
+  the URL from the injected `DATABASE_URL` (no `-x`/`ALEMBIC_DB_URL`).
+- **`api`**: `depends_on` migrate `service_completed_successfully` + redis healthy;
+  uvicorn factory; port `${API_PORT:-8000}:8000`; healthcheck via a `python -c urllib`
+  one-liner (slim image has no curl).
+
+**Test harness:** added a reusable **`client`** fixture to `conftest.py` — spins up the
+app and **overrides `get_session`** to bind to the testcontainers DB (the canonical
+API-test entry point for Steps 4/6/7/9b). `test_health.py` asserts `200 {status:ok, db:ok}`.
+⚠️ Note recorded in the fixture: `client` requests **commit** through real sessions (no
+rollback isolation like `db_conn`) — write-path tests in Step 4 should use distinct ids
+or truncate between tests.
+
+**Tooling:** added `[tool.ruff.lint.flake8-bugbear] extend-immutable-calls` for FastAPI
+DI markers (Depends/Query/Path/Header/Body) so future routers with arg-default DI don't trip B008.
+
+**Deviations from the plan:** none. Two judgment calls: (1) used the `Annotated` DI form
+instead of `Depends()` defaults (cleaner, lint-clean); (2) added the reusable `client`
+fixture to the shared harness now rather than inline in `test_health.py`, since Step 4+
+need it — consistent with the "establish the harness once" convention.
+
+**Verify — all passed:**
+- `docker compose build` → `fleetpulse-backend:local` built. `docker compose config` valid (anchors OK).
+- **Fresh-volume run** (`down -v` → `up -d`): migrate log shows `Running upgrade -> 0001`,
+  migrate exit code **0**, api gated on its completion → reached **healthy**. Proves the
+  migrate service genuinely applies the schema (not relying on a pre-migrated DB).
+- `curl localhost:8000/api/v1/health` → `200 {"status":"ok","db":"ok"}`.
+- `uv run pytest` → **10/10 green** (added `test_health` via the `client` fixture). `make lint` clean.
+
+**Seams / facts the next agent (Step 4 — ingest) needs:**
+- Add the `telemetry` router under `app/api/` and `include_router` it in `app/api/__init__.py`
+  (alongside `health`). Use `SessionDep` from `app/api/deps.py` for the DB session.
+- The `client` fixture is ready for ingest endpoint tests — but it **commits**; plan a
+  truncate-between-tests step (or unique ids) for write-path tests. `db_conn` (rollback)
+  remains for pure-DB tests; `seed_readings` is available for seeding vehicles/readings.
+- Back-pressure inputs already surfaced in `settings`: `db_pool_acquire_timeout_seconds`
+  (pool exhaustion → 503) and the body/batch caps live in `.env.example`
+  (`MAX_BATCH_READINGS`, `MAX_BODY_BYTES`) — add the matching fields to `Settings` in Step 4.
+- Body-size cap needs **ASGI middleware** (Starlette has no built-in max-body); the
+  app factory in `main.py` is where to add it.
