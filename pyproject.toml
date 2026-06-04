@@ -1,0 +1,67 @@
+[project]
+name = "fleetpulse"
+version = "0.1.0"
+description = "FleetPulse — fleet telemetry & alerting platform (backend + simulator)"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+
+# Runtime dependencies. Lower bounds are pinned here; exact versions are locked
+# in uv.lock (the package-lock.json analogue) so installs are reproducible.
+dependencies = [
+    "fastapi>=0.115,<0.116",
+    "uvicorn[standard]>=0.34,<0.35",
+    "pydantic>=2.10,<3",
+    "pydantic-settings>=2.7,<3",
+    "sqlalchemy[asyncio]>=2.0.36,<2.1",
+    "asyncpg>=0.30,<0.31",
+    "alembic>=1.14,<1.15",
+    "celery[redis]>=5.4,<5.5",
+    "redis>=5.2,<6",
+]
+
+[dependency-groups]
+# Dev/test tooling. Installed by `uv sync` (which includes dependency-groups by
+# default); excluded from the production image build in later steps.
+dev = [
+    "pytest>=8.3,<9",
+    "pytest-asyncio>=0.25,<0.26",
+    "httpx>=0.28,<0.29",
+    "testcontainers[postgres,redis]>=4.9,<5",
+    "ruff>=0.9,<0.10",
+    "mypy>=1.14,<2",
+    "locust>=2.32,<3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# The repo ships several top-level packages (backend/, simulator/) rather than a
+# single importable distribution; tell hatch this is a non-package (app) project.
+[tool.hatch.build.targets.wheel]
+bypass-selection = true
+
+[tool.ruff]
+# Lint scope: backend/ and simulator/ only — NOT frontend/ (TS, own toolchain).
+target-version = "py312"
+line-length = 100
+src = ["backend", "simulator"]
+include = ["backend/**/*.py", "simulator/**/*.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["backend", "simulator"]
+strict = true
+plugins = ["pydantic.mypy"]
+# Third-party libs without bundled type stubs — don't fail the type check on them.
+[[tool.mypy.overrides]]
+module = ["testcontainers.*", "celery.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["backend/tests"]
+python_files = ["test_*.py"]

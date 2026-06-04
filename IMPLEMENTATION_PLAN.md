@@ -73,7 +73,7 @@ Ingest does `INSERT … ON CONFLICT (vehicle_id, ts) DO NOTHING RETURNING …`, 
 > Flip `TODO → IN PROGRESS → DONE` as you work. The first `TODO` is the next step.
 
 - [x] **Step 0** — Environment prerequisites (Docker, uv, Python 3.12, smoke tests) — `DONE` (human-owned; completed 2026-06-03. Smoke tests passed: Redis `PONG`, TimescaleDB extension `2.27.2` loaded. `websocat` skipped — optional, only for Step 10.)
-- [ ] **Step 1** — Repo scaffolding, tooling, infra-only Compose — `TODO`
+- [x] **Step 1** — Repo scaffolding, tooling, infra-only Compose — `DONE`
 - [ ] **Step 2** — Database foundation (models, Alembic, hypertable, indexes) — `TODO`
 - [ ] **Step 3** — FastAPI app skeleton + health + DB session + `migrate`/`api` containers — `TODO`
 - [ ] **Step 4** — Ingest endpoint `POST /telemetry` (validation, idempotency, back-pressure) — `TODO`
@@ -488,4 +488,79 @@ Each is independent; do any/none. See `SPEC.md` §9 M7, §10.7. **Do not start t
 
 > Append one entry per completed (or attempted) step. Newest at the bottom. This is the authoritative handoff record between agents. **Always record seam locations** that later steps depend on.
 
-_(empty — Step 1 agent writes the first entry here)_
+### Step 1 — Repo scaffolding, tooling, infra-only Compose — DONE (2026-06-03)
+
+**What I built:** the project skeleton, dependency/tooling config, the canonical
+test-DB harness, and an infra-only Docker Compose. No app code (correct for Step 1).
+
+**Dependency mgmt — `uv` (not pip).** `pyproject.toml` defines runtime deps and a
+`dev` dependency-group; `uv sync` built `.venv` and wrote **`uv.lock`** (the exact
+pin / `package-lock.json` analogue). Lower bounds are in `pyproject.toml`; exact
+versions live in `uv.lock`. Resolved key versions: fastapi 0.115.x, sqlalchemy
+2.0.50, asyncpg 0.30.x, alembic 1.14.x, celery 5.4.x, redis-py 5.3.1, pydantic
+2.x, testcontainers 4.13.3, ruff 0.9.10, mypy (strict).
+
+**Image tags pinned (match in Compose + tests):** `timescale/timescaledb:2.27.2-pg16`
+(current stable, verified in Step 0) and `redis:7.4`. The testcontainers harness
+hardcodes the **same** two tags (`conftest.py` constants) so tests == Compose.
+
+**DB/user/db names:** Postgres user/password/db all `fleetpulse`; async URL
+`postgresql+asyncpg://fleetpulse:fleetpulse@timescaledb:5432/fleetpulse`. Ports use
+the free defaults (5432, 6379).
+
+**Config bootstrap decision:** the Makefile `up` target copies `.env.example → .env`
+if absent **and** every Compose var also has a `${VAR:-default}` fallback (belt +
+suspenders — a raw `docker compose up` works with no `.env` too). `.env` is
+git-ignored; only `.env.example` is committed. `.env.example` is seeded with **all**
+vars later steps need (DB/Redis URLs, pool size + acquire timeout, batch/body caps,
+broker queue-depth threshold, CORS origins, Vite API/WS base URLs, ingest API-key
+placeholder, sim knobs) — Step 1 only actually uses the Postgres/Redis pieces.
+
+**Files added:**
+- `pyproject.toml` (deps, ruff + mypy + pytest config; lint/type scope =
+  `backend/` + `simulator/`, NOT `frontend/`), `uv.lock`.
+- `.gitignore`, `.env.example`, `docker-compose.yml` (infra only), `Makefile`
+  (`up`/`down`/`lint`/`fmt`/`test`/`sync`), `README.md` skeleton.
+- `backend/app/` package tree with `__init__.py` in every package
+  (`db/ models/ schemas/ api/ services/ workers/ ws/`), `backend/alembic/.gitkeep`.
+- `simulator/__init__.py` (made it a real package so mypy/ruff have a file to
+  check — empty `simulator/` made strict mypy error "no .py files").
+- `frontend/.gitkeep`, `load/.gitkeep` (placeholders; TS / load-test land later).
+
+**SEAM later steps depend on — the test-DB harness (`backend/tests/conftest.py`):**
+this is the canonical mechanism; **later agents must NOT stand up their own DB.**
+Fixtures provided:
+- `db_container` / `redis_container` (session): ephemeral TimescaleDB + Redis via
+  testcontainers (pinned images).
+- `database_url` / `redis_url` (session): connection URLs.
+- `db_settings` (session): **the place Step 2 must add `alembic upgrade head`** —
+  there's an explicit `TODO(Step 2)` marker on the exact line. Until migrations
+  exist it just yields the URL so the harness can be smoke-tested.
+- `db_engine` / `db_conn` (function): per-test async engine + transaction that
+  **rolls back** for isolation.
+- `seed_readings` (function): the reuse point for "insert N readings for a vehicle"
+  — currently raises `NotImplementedError` (no `telemetry_reading` table yet);
+  Step 2+ fills in the INSERT. **Tests self-seed via this; never via the simulator.**
+`backend/tests/test_harness.py` is a throwaway Step-1 smoke test proving the harness
+(SELECT 1, timescaledb extension available, Redis PING) — later steps can replace it.
+
+**Deviations from the plan:** none material. Two judgment calls worth noting:
+(1) made `simulator/` a package (`__init__.py`) instead of a bare placeholder dir,
+because strict mypy errors on an empty directory in its `files` list; (2) added
+`${VAR:-default}` fallbacks in Compose *in addition to* the `.env` bootstrap rather
+than picking just one — strictly more robust, still documented.
+
+**Verify — all passed:**
+- `docker compose up -d timescaledb redis` → both report `healthy` in `docker compose ps`.
+- `psql ... pg_available_extensions WHERE name='timescaledb'` → 1 row (available;
+  it gets `CREATE`d in Step 2).
+- `uv run pytest` → 3/3 green via the testcontainers harness (SELECT 1, extension,
+  Redis ping) — proves the test-DB plumbing before any real test depends on it.
+- `make up` from a clean checkout with no `.env` → bootstraps `.env`, stack starts.
+- `make lint` (ruff + mypy strict) → clean.
+
+**Notes for the next agent (Step 2):** add `alembic upgrade head` at the
+`TODO(Step 2)` marker in `conftest.py::db_settings`, and implement `seed_readings`
+once `telemetry_reading` exists. Remember the conventions: `telemetry_reading` has
+**no surrogate `id`** (composite PK `(vehicle_id, ts)`), and the hypertable/index
+DDL in Step 2 is transaction-safe (the autocommit-block requirement is Step 7 only).

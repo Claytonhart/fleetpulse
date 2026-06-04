@@ -1,0 +1,41 @@
+# FleetPulse — Docker Compose.
+# Step 1: INFRA ONLY (timescaledb + redis). App services (migrate, api, worker,
+# beat, simulator, web) are added in their own later steps.
+#
+# Config comes from .env (bootstrapped by `make up`). Every var also has a safe
+# ${VAR:-default} fallback so a raw `docker compose up` works without a .env too.
+
+services:
+  timescaledb:
+    # Pinned exact patch tag — NOT latest. Timescale's continuous-aggregate /
+    # retention / compression APIs change across versions; an unpinned image would
+    # silently break Step 7 migrations on a future pull. 2.27.2 = current stable.
+    image: timescale/timescaledb:2.27.2-pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fleetpulse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fleetpulse}
+      POSTGRES_DB: ${POSTGRES_DB:-fleetpulse}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fleetpulse} -d ${POSTGRES_DB:-fleetpulse}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7.4
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  timescale_data:

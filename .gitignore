@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment / secrets — only .env.example is committed
+.env
+.env.*
+!.env.example
+
+# Node / frontend (later steps)
+node_modules/
+frontend/dist/
+*.local
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
